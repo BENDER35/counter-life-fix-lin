@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script de automatización de compatibilidad para Counter-Life en Xash3D (Linux)
-# Desarrollado para motores Xash3D FWGS (x86 32-bit / x86_64 / ARM)
+# Script de automatización de compatibilidad para Counter-Life en Xash3D
+# Compatible con Ubuntu, Xubuntu, Kubuntu, Debian y derivados (i386 / amd64 / ARM)
 # ==============================================================================
+
+# Si fue invocado con /bin/sh (dash en Debian/Ubuntu), reejecutar con bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /usr/bin/env bash "$0" "$@"
+fi
 
 set -euo pipefail
 
@@ -18,12 +23,40 @@ log_success() { echo -e "${COLOR_SUCCESS}[OK]${COLOR_RESET} $*"; }
 log_warn()    { echo -e "${COLOR_WARN}[AVISO]${COLOR_RESET} $*"; }
 log_error()   { echo -e "${COLOR_ERROR}[ERROR]${COLOR_RESET} $*" >&2; }
 
+# Función para ejecutar comandos con privilegios elevados (compatible con Ubuntu/Debian)
+run_as_root() {
+    local cmd="$*"
+    if [ "$EUID" -eq 0 ]; then
+        bash -c "$cmd"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo bash -c "$cmd"
+    elif command -v su >/dev/null 2>&1; then
+        echo -e "${COLOR_WARN}Se requieren permisos de administrador. Introduce la contraseña de root:${COLOR_RESET}"
+        su -c "$cmd"
+    else
+        log_error "Se requieren permisos de administrador para instalar paquetes, pero ni 'sudo' ni 'su' están disponibles."
+        log_error "Por favor, ejecuta este script como root o instala 'sudo'."
+        exit 1
+    fi
+}
+
 echo "=================================================================="
 echo "    Instalador de compatibilidad Linux para Counter-Life (Xash3D)"
+echo "   (Probado en Ubuntu, Xubuntu, Kubuntu, Debian y derivados)"
 echo "=================================================================="
 
 # 1. Determinar el directorio base de Xash3D
-TARGET_DIR="${1:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
+TARGET_DIR="${1:-}"
+if [ -z "$TARGET_DIR" ]; then
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+    while [ -h "$SCRIPT_PATH" ]; do
+        SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+        SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+        [[ $SCRIPT_PATH != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+    done
+    TARGET_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+fi
+
 log_info "Directorio objetivo de Xash3D: $TARGET_DIR"
 
 if [ ! -d "$TARGET_DIR" ]; then
@@ -48,7 +81,7 @@ fi
 
 log_info "Carpeta de mod detectada: $MOD_DIR"
 
-# 3. Detectar la arquitectura del ejecutable de Xash3D o del sistema
+# 3. Detectar la arquitectura exacta del binario de Xash3D o del sistema
 ARCH=""
 XASH_BIN=""
 if [ -f "$TARGET_DIR/xash" ]; then
@@ -57,6 +90,7 @@ elif [ -f "$TARGET_DIR/xash3d" ]; then
     XASH_BIN="$TARGET_DIR/xash3d"
 fi
 
+# Intento 1: Usando file si está instalado
 if [ -n "$XASH_BIN" ] && command -v file >/dev/null 2>&1; then
     FILE_INFO=$(file -b "$XASH_BIN" || true)
     if [[ "$FILE_INFO" =~ 32-bit.*80386|Intel\ 80386|i386 ]]; then
@@ -70,7 +104,25 @@ if [ -n "$XASH_BIN" ] && command -v file >/dev/null 2>&1; then
     fi
 fi
 
-# Respaldo con uname -m si no se detectó por binario
+# Intento 2: Usando od (parte de coreutils, siempre presente en cualquier Linux)
+if [ -z "$ARCH" ] && [ -n "$XASH_BIN" ] && command -v od >/dev/null 2>&1; then
+    HEADER=($(od -An -t u1 -N 20 "$XASH_BIN" 2>/dev/null || true))
+    if [ "${#HEADER[@]}" -ge 20 ]; then
+        BIT_CLASS="${HEADER[4]}"
+        MACHINE="${HEADER[18]}"
+        if [ "$BIT_CLASS" = "1" ] && [ "$MACHINE" = "3" ]; then
+            ARCH="linux-i386"
+        elif [ "$BIT_CLASS" = "2" ] && [ "$MACHINE" = "62" ]; then
+            ARCH="linux-amd64"
+        elif [ "$BIT_CLASS" = "2" ] && [ "$MACHINE" = "183" ]; then
+            ARCH="linux-arm64"
+        elif [ "$BIT_CLASS" = "1" ] && [ "$MACHINE" = "40" ]; then
+            ARCH="linux-armhf"
+        fi
+    fi
+fi
+
+# Intento 3: Respaldo con uname -m
 if [ -z "$ARCH" ]; then
     UNAME_M=$(uname -m)
     case "$UNAME_M" in
@@ -78,7 +130,12 @@ if [ -z "$ARCH" ]; then
             ARCH="linux-i386"
             ;;
         x86_64)
-            ARCH="linux-amd64"
+            # Si el directorio indica i386 pero uname dice x86_64, preferir i386
+            if [[ "$TARGET_DIR" =~ i386 ]]; then
+                ARCH="linux-i386"
+            else
+                ARCH="linux-amd64"
+            fi
             ;;
         aarch64|arm64)
             ARCH="linux-arm64"
@@ -87,55 +144,57 @@ if [ -z "$ARCH" ]; then
             ARCH="linux-armhf"
             ;;
         *)
-            log_warn "Arquitectura no estándar detectada ($UNAME_M). Asumiendo linux-i386 por defecto."
+            log_warn "Arquitectura no estándar ($UNAME_M). Usando linux-i386 por defecto."
             ARCH="linux-i386"
             ;;
     esac
 fi
 
-log_info "Arquitectura seleccionada para el mod: $ARCH"
+log_info "Arquitectura seleccionada: $ARCH"
 
 # 4. Comprobación y autoinstalación de paquetes necesarios vía apt
-log_info "Comprobando paquetes requeridos en el sistema..."
+log_info "Comprobando paquetes y librerías del sistema..."
 
 REQUIRED_PKGS=()
 MISSING_PKGS=()
-NEED_ADD_ARCH=false
+NEED_ADD_I386=false
 
-# Herramientas necesarias para la descarga, inspección y descompresión
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    REQUIRED_PKGS+=("curl")
-fi
-if ! command -v unzip >/dev/null 2>&1; then
-    REQUIRED_PKGS+=("unzip")
-fi
-if ! command -v file >/dev/null 2>&1; then
-    REQUIRED_PKGS+=("file")
-fi
+# Herramientas esenciales
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || REQUIRED_PKGS+=("curl")
+command -v unzip >/dev/null 2>&1 || REQUIRED_PKGS+=("unzip")
+command -v file >/dev/null 2>&1 || REQUIRED_PKGS+=("file")
 REQUIRED_PKGS+=("ca-certificates")
 
-# Librerías en tiempo de ejecución (C, C++, GCC) requeridas por los binarios nativos
+# Librerías en tiempo de ejecución (C, C++, GCC) según arquitectura
 if command -v dpkg >/dev/null 2>&1; then
     HOST_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
 
     if [ "$ARCH" = "linux-i386" ]; then
         if [ "$HOST_ARCH" != "i386" ]; then
             if ! dpkg --print-foreign-architectures 2>/dev/null | grep -q "^i386$"; then
-                log_warn "Multiarch i386 no está habilitado en dpkg."
-                NEED_ADD_ARCH=true
+                NEED_ADD_I386=true
             fi
         fi
         REQUIRED_PKGS+=("libc6:i386" "libstdc++6:i386")
-        if apt-cache show libgcc-s1:i386 >/dev/null 2>&1; then
+
+        # Seleccionar libgcc apropiado para la versión de Debian/Ubuntu
+        if dpkg -l libgcc-s1 >/dev/null 2>&1; then
             REQUIRED_PKGS+=("libgcc-s1:i386")
-        elif apt-cache show libgcc1:i386 >/dev/null 2>&1; then
+        elif dpkg -l libgcc1 >/dev/null 2>&1; then
             REQUIRED_PKGS+=("libgcc1:i386")
+        else
+            REQUIRED_PKGS+=("libgcc-s1:i386")
         fi
     elif [ "$ARCH" = "linux-amd64" ]; then
-        REQUIRED_PKGS+=("libc6" "libstdc++6" "libgcc-s1")
+        REQUIRED_PKGS+=("libc6" "libstdc++6")
+        if dpkg -l libgcc-s1 >/dev/null 2>&1; then
+            REQUIRED_PKGS+=("libgcc-s1")
+        else
+            REQUIRED_PKGS+=("libgcc1")
+        fi
     fi
 
-    # Verificar cuáles paquetes faltan por instalar
+    # Comprobar qué paquetes faltan actualmente instalados
     for pkg in "${REQUIRED_PKGS[@]}"; do
         if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
             MISSING_PKGS+=("$pkg")
@@ -143,52 +202,51 @@ if command -v dpkg >/dev/null 2>&1; then
     done
 fi
 
-# Si faltan paquetes o se necesita habilitar multiarch, usar apt
-if [ ${#MISSING_PKGS[@]} -gt 0 ] || [ "$NEED_ADD_ARCH" = true ]; then
+# Instalar con apt si falta algún paquete o se requiere habilitar multiarch i386
+if [ ${#MISSING_PKGS[@]} -gt 0 ] || [ "$NEED_ADD_I386" = true ]; then
     if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
-        APT_BIN="apt-get"
-        command -v apt-get >/dev/null 2>&1 || APT_BIN="apt"
+        APT_TOOL="apt-get"
+        command -v apt-get >/dev/null 2>&1 || APT_TOOL="apt"
 
-        SUDO_CMD=""
-        if [ "$EUID" -ne 0 ]; then
-            if command -v sudo >/dev/null 2>&1; then
-                SUDO_CMD="sudo"
+        if [ "$NEED_ADD_I386" = true ]; then
+            log_info "Habilitando soporte multiarch i386 en dpkg..."
+            run_as_root "dpkg --add-architecture i386"
+        fi
+
+        log_warn "Se detectaron paquetes faltantes en el sistema: ${MISSING_PKGS[*]}"
+        log_info "Actualizando repositorios e instalando dependencias mediante apt..."
+
+        # Intentar instalación de los paquetes faltantes
+        INSTALL_CMD="DEBIAN_FRONTEND=noninteractive $APT_TOOL update && DEBIAN_FRONTEND=noninteractive $APT_TOOL install -y ${MISSING_PKGS[*]}"
+        if ! run_as_root "$INSTALL_CMD"; then
+            # Si falla por libgcc-s1 vs libgcc1 en versiones antiguas de Debian/Ubuntu, reintentar con libgcc1
+            if [[ " ${MISSING_PKGS[*]} " =~ "libgcc-s1:i386" ]]; then
+                log_warn "Reintentando con libgcc1:i386 para compatibilidad con versiones anteriores..."
+                ALT_PKGS=("${MISSING_PKGS[@]/libgcc-s1:i386/libgcc1:i386}")
+                run_as_root "DEBIAN_FRONTEND=noninteractive $APT_TOOL install -y ${ALT_PKGS[*]}"
             else
-                log_error "Se requieren permisos de administrador para instalar paquetes con apt, pero 'sudo' no está disponible."
-                log_error "Ejecuta este script como root o instala manualmente: ${MISSING_PKGS[*]}"
+                log_error "Falló la instalación de paquetes con apt. Revisa tu conexión a internet o repositorios."
                 exit 1
             fi
         fi
-
-        if [ "$NEED_ADD_ARCH" = true ]; then
-            log_info "Habilitando arquitectura i386: $SUDO_CMD dpkg --add-architecture i386"
-            $SUDO_CMD dpkg --add-architecture i386
-        fi
-
-        log_warn "Paquetes faltantes detectados: ${MISSING_PKGS[*]}"
-        log_info "Actualizando índices de paquetes con apt..."
-        $SUDO_CMD $APT_BIN update
-
-        log_info "Instalando paquetes faltantes: $SUDO_CMD $APT_BIN install -y ${MISSING_PKGS[*]}"
-        $SUDO_CMD $APT_BIN install -y "${MISSING_PKGS[@]}"
-        log_success "Paquetes instalados correctamente."
+        log_success "Dependencias del sistema instaladas correctamente."
     else
         log_error "Faltan paquetes necesarios (${MISSING_PKGS[*]}) y 'apt' no está disponible en este sistema."
-        log_error "Instálalos manualmente utilizando el gestor de paquetes de tu distribución."
+        log_error "Por favor instálalos manualmente con el gestor de paquetes de tu distribución."
         exit 1
     fi
 else
     log_success "Todos los paquetes y librerías necesarias del sistema están instalados."
 fi
 
-# Configurar herramienta de descarga
+# Configurar herramienta de descarga (curl o wget)
 DOWNLOADER=""
 if command -v curl >/dev/null 2>&1; then
     DOWNLOADER="curl"
 elif command -v wget >/dev/null 2>&1; then
     DOWNLOADER="wget"
 else
-    log_error "Ni 'curl' ni 'wget' están disponibles tras la comprobación de paquetes."
+    log_error "Ni 'curl' ni 'wget' están disponibles en el sistema."
     exit 1
 fi
 
@@ -234,21 +292,25 @@ cp "$CLIENT_SOURCE" "$MOD_DIR/cl_dlls/client.so"
 chmod +x "$MOD_DIR/cl_dlls/client.so"
 log_success "Instalado: $MOD_DIR/cl_dlls/client.so"
 
-# 7. Configurar liblist.gam
+# 7. Configurar liblist.gam (manejando correctamente formatos CRLF de Windows)
 LIBLIST="$MOD_DIR/liblist.gam"
 if [ -f "$LIBLIST" ]; then
-    if grep -q "gamedll_linux" "$LIBLIST"; then
-        log_info "'gamedll_linux' ya existe en liblist.gam. Actualizando ruta si es necesario..."
-        sed -i -E 's|gamedll_linux[[:space:]]+".*"|gamedll_linux "dlls/cl.so"|g' "$LIBLIST"
+    # Limpiar retornos de carro \r para evitar problemas de formato
+    tr -d '\r' < "$LIBLIST" > "$TMP_DIR/liblist_clean.gam"
+    cp "$LIBLIST" "$LIBLIST.bak"
+
+    if grep -q "gamedll_linux" "$TMP_DIR/liblist_clean.gam"; then
+        log_info "'gamedll_linux' ya existe en liblist.gam. Actualizando ruta..."
+        sed -i -E 's|gamedll_linux[[:space:]]+".*"|gamedll_linux "dlls/cl.so"|g' "$TMP_DIR/liblist_clean.gam"
     else
         log_info "Agregando directiva 'gamedll_linux' a liblist.gam..."
-        cp "$LIBLIST" "$LIBLIST.bak"
-        if grep -q "gamedll" "$LIBLIST"; then
-            sed -i '/gamedll[[:space:]]/a gamedll_linux "dlls/cl.so"' "$LIBLIST"
+        if grep -q "gamedll" "$TMP_DIR/liblist_clean.gam"; then
+            sed -i '/gamedll[[:space:]]/a gamedll_linux "dlls/cl.so"' "$TMP_DIR/liblist_clean.gam"
         else
-            echo 'gamedll_linux "dlls/cl.so"' >> "$LIBLIST"
+            echo 'gamedll_linux "dlls/cl.so"' >> "$TMP_DIR/liblist_clean.gam"
         fi
     fi
+    cp "$TMP_DIR/liblist_clean.gam" "$LIBLIST"
     log_success "Archivo $LIBLIST configurado correctamente."
 else
     log_warn "No se encontró liblist.gam en $MOD_DIR. Creando uno básico..."
@@ -271,9 +333,15 @@ EOF
     log_success "Archivo liblist.gam creado."
 fi
 
-# 8. Verificación final rápida con xash (si existe)
+# Ajustar propietarios si el script fue ejecutado con sudo
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    USER_GROUP=$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")
+    chown -R "$SUDO_USER:$USER_GROUP" "$MOD_DIR/dlls/cl.so" "$MOD_DIR/cl_dlls/client.so" "$LIBLIST" 2>/dev/null || true
+fi
+
+# 8. Verificación final rápida con xash (si existe el binario)
 if [ -f "$TARGET_DIR/xash" ]; then
-    log_info "Verificando carga con el motor..."
+    log_info "Verificando inicialización con el motor Xash3D..."
     if (cd "$TARGET_DIR" && ./xash -dev 0 -game "$(basename "$MOD_DIR")" +quit >/dev/null 2>&1); then
         log_success "¡Comprobación exitosa! Xash3D reconoció e inicializó Counter-Life correctamente."
     else

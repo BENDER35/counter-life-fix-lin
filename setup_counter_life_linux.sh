@@ -48,23 +48,7 @@ fi
 
 log_info "Carpeta de mod detectada: $MOD_DIR"
 
-# 3. Comprobar herramientas requeridas (curl/wget y unzip)
-DOWNLOADER=""
-if command -v curl >/dev/null 2>&1; then
-    DOWNLOADER="curl"
-elif command -v wget >/dev/null 2>&1; then
-    DOWNLOADER="wget"
-else
-    log_error "Se necesita 'curl' o 'wget' para descargar los binarios. Instálalo con tu gestor de paquetes."
-    exit 1
-fi
-
-if ! command -v unzip >/dev/null 2>&1; then
-    log_error "Se necesita la utilidad 'unzip' para descomprimir los binarios."
-    exit 1
-fi
-
-# 4. Detectar la arquitectura del ejecutable de Xash3D o del sistema
+# 3. Detectar la arquitectura del ejecutable de Xash3D o del sistema
 ARCH=""
 XASH_BIN=""
 if [ -f "$TARGET_DIR/xash" ]; then
@@ -110,6 +94,103 @@ if [ -z "$ARCH" ]; then
 fi
 
 log_info "Arquitectura seleccionada para el mod: $ARCH"
+
+# 4. Comprobación y autoinstalación de paquetes necesarios vía apt
+log_info "Comprobando paquetes requeridos en el sistema..."
+
+REQUIRED_PKGS=()
+MISSING_PKGS=()
+NEED_ADD_ARCH=false
+
+# Herramientas necesarias para la descarga, inspección y descompresión
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    REQUIRED_PKGS+=("curl")
+fi
+if ! command -v unzip >/dev/null 2>&1; then
+    REQUIRED_PKGS+=("unzip")
+fi
+if ! command -v file >/dev/null 2>&1; then
+    REQUIRED_PKGS+=("file")
+fi
+REQUIRED_PKGS+=("ca-certificates")
+
+# Librerías en tiempo de ejecución (C, C++, GCC) requeridas por los binarios nativos
+if command -v dpkg >/dev/null 2>&1; then
+    HOST_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+
+    if [ "$ARCH" = "linux-i386" ]; then
+        if [ "$HOST_ARCH" != "i386" ]; then
+            if ! dpkg --print-foreign-architectures 2>/dev/null | grep -q "^i386$"; then
+                log_warn "Multiarch i386 no está habilitado en dpkg."
+                NEED_ADD_ARCH=true
+            fi
+        fi
+        REQUIRED_PKGS+=("libc6:i386" "libstdc++6:i386")
+        if apt-cache show libgcc-s1:i386 >/dev/null 2>&1; then
+            REQUIRED_PKGS+=("libgcc-s1:i386")
+        elif apt-cache show libgcc1:i386 >/dev/null 2>&1; then
+            REQUIRED_PKGS+=("libgcc1:i386")
+        fi
+    elif [ "$ARCH" = "linux-amd64" ]; then
+        REQUIRED_PKGS+=("libc6" "libstdc++6" "libgcc-s1")
+    fi
+
+    # Verificar cuáles paquetes faltan por instalar
+    for pkg in "${REQUIRED_PKGS[@]}"; do
+        if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            MISSING_PKGS+=("$pkg")
+        fi
+    done
+fi
+
+# Si faltan paquetes o se necesita habilitar multiarch, usar apt
+if [ ${#MISSING_PKGS[@]} -gt 0 ] || [ "$NEED_ADD_ARCH" = true ]; then
+    if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+        APT_BIN="apt-get"
+        command -v apt-get >/dev/null 2>&1 || APT_BIN="apt"
+
+        SUDO_CMD=""
+        if [ "$EUID" -ne 0 ]; then
+            if command -v sudo >/dev/null 2>&1; then
+                SUDO_CMD="sudo"
+            else
+                log_error "Se requieren permisos de administrador para instalar paquetes con apt, pero 'sudo' no está disponible."
+                log_error "Ejecuta este script como root o instala manualmente: ${MISSING_PKGS[*]}"
+                exit 1
+            fi
+        fi
+
+        if [ "$NEED_ADD_ARCH" = true ]; then
+            log_info "Habilitando arquitectura i386: $SUDO_CMD dpkg --add-architecture i386"
+            $SUDO_CMD dpkg --add-architecture i386
+        fi
+
+        log_warn "Paquetes faltantes detectados: ${MISSING_PKGS[*]}"
+        log_info "Actualizando índices de paquetes con apt..."
+        $SUDO_CMD $APT_BIN update
+
+        log_info "Instalando paquetes faltantes: $SUDO_CMD $APT_BIN install -y ${MISSING_PKGS[*]}"
+        $SUDO_CMD $APT_BIN install -y "${MISSING_PKGS[@]}"
+        log_success "Paquetes instalados correctamente."
+    else
+        log_error "Faltan paquetes necesarios (${MISSING_PKGS[*]}) y 'apt' no está disponible en este sistema."
+        log_error "Instálalos manualmente utilizando el gestor de paquetes de tu distribución."
+        exit 1
+    fi
+else
+    log_success "Todos los paquetes y librerías necesarias del sistema están instalados."
+fi
+
+# Configurar herramienta de descarga
+DOWNLOADER=""
+if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
+elif command -v wget >/dev/null 2>&1; then
+    DOWNLOADER="wget"
+else
+    log_error "Ni 'curl' ni 'wget' están disponibles tras la comprobación de paquetes."
+    exit 1
+fi
 
 # 5. Descargar el paquete de binarios compilado por FWGS
 DOWNLOAD_URL="https://github.com/FWGS/hlsdk-mega-build/releases/download/continuous/Counter-Life-${ARCH}.zip"

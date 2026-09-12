@@ -35,7 +35,7 @@ C:\Program Files (x86)\Steam\steamapps\common\
 4.  ahora, abrid otro explorador, descomprimid xash3d, en entorno comando es el siguiente: tar -xzvf ARCHIVO_XASH3D.tar.gz, si es en entorno grafico, sigue los pasos establecidos en la distro.
 5.  ahora turno para el mod, el comando es unzip -d /home/USUARIO/Descargas/DIRECTORIO_XASH3D ZIP_COUNTER-LIFE.zip.
 6.  ahora con xash3d y el mod, atentos, teneis que copiar en un pen o transferir via SSH a tu equipo con linux (la transferencia se hace via filezilla) la carpeta valve completa al directorio de xash3d.
-7.  ahora bajad el parche .sh
+7.  ahora bajad el parche .sh y este parche tienes que copiarlo a la carpeta de instalacion donde tengas el xash3d, para ello, ya que los pasos siguientes son por comandos, el comando para copiar archivos es el mismo que MS-DOS-windows (CMD-powershell), pero sin la o ni la y, o sea, cp /home/USUARIO/Descargas/setup_counter_life_linux.sh /home/USUARIO/Descargas/XASH/counter_life_fix.sh
 8.  hacedlo ejecutable, este si tiene que ser por comandos, el comando es chmod +x setup_counter_life_linux.sh
 9.  ahora teclead ./setup_counter_life_linux.sh
 10.  el script hara su trabajo, entre ellos descargar el SDK de half-life en la carpeta temporal (/tmp) y compilar los archivos necesarios para hacer compatible este mod.
